@@ -14,17 +14,18 @@ import           Data.Aeson.Encode.Pretty
 import qualified Data.Aeson as A
 import           Data.Aeson.Types
 import qualified Data.Attoparsec.ByteString as ABS
-import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
 
 main :: IO ()
 main = do
   putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
+  cf <- readCloudFlare
+  putStrLn $ "Using cf:" ++ (show cf)
   let options = defaultConnectionOptions
-  let headers = [("Cookie","__cfduid=d11e6a51d6d37fa3926599c6a50a090191511988745; cf_clearance=e94417b5a9746498f99ad11a1994311528ab10e3-1519465540-10800")
-                ,("User-Agent","Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/64.0.3282.167 Safari/537.36")
-               ] 
-  runSecureClientWith "socket.bittrex.com"  443 (exportURL relativeUrl) options headers ws
+  let headers = [("Cookie", BS.pack (cookies cf))
+                ,("User-Agent", BS.pack (userAgent cf))] 
+  runSecureClientWith "socket.bittrex.com" 443 (exportURL relativeUrl) options headers ws
   
   putStrLn "Finished"
   putStrLn $ exportURL relativeUrl 
@@ -38,6 +39,22 @@ socketParams =
   , ("connectionData","[{\"name\":\"corehub\"}]")
   , ("tid","1")
   ]
+
+readCloudFlare = do
+  content <- BL.readFile "cf.json"
+  let eitherR = A.eitherDecode content :: Either String CloudFlare
+  case eitherR of
+    Left msg -> error msg
+    Right cf -> return cf
+
+
+data CloudFlare = CloudFlare {
+    cookies :: String
+  , userAgent :: String
+} deriving (Generic, Show)
+
+instance FromJSON CloudFlare
+
 
 
 
