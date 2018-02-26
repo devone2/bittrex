@@ -16,7 +16,8 @@ import           Data.Aeson.Types
 import qualified Data.Attoparsec.ByteString as ABS
 import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
-
+import           Data.Maybe
+import qualified Data.Text as T
 main :: IO ()
 main = do
   putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
@@ -59,12 +60,10 @@ instance FromJSON CloudFlare
 
 
 subscribeToExchangeDeltas pair = ServerSideMsg "corehub" "SubscribeToExchangeDeltas" (toJSON [pair])
+queryExchangeState pair = ServerSideMsg "corehub" "QueryExchangeState" (toJSON [pair])
 
-parseClientSideMsg smsg = (m smsg) >>= parseMaybe parseJSON  :: Maybe [ClientSideMsg]
 
-parseDelta csm = parseEither parseJSON (args csm) :: Either String [BtrDelta]
-
-  
+ 
 show2 smsg = encodePretty $ m smsg
 
 show3 :: ClientSideMsg -> BL.ByteString
@@ -79,26 +78,26 @@ ws connection = do
     let q = A.encode $ subscribeToExchangeDeltas ("BTC-ETH"::String)
     BL.putStrLn q
     sendTextData connection q
+    let q = A.encode $ subscribeToExchangeDeltas ("BTC-RDD"::String)
+    BL.putStrLn q
+    sendTextData connection q
 
+
+    let queryCommand = A.encode $ queryExchangeState ("BTC-ETH"::String)
+    BL.putStrLn queryCommand
+    sendTextData connection queryCommand
+    
     void . forkIO . forever $ do
         message <- (receiveData connection) :: IO BL.ByteString
-        putStrLn "------- Message Received ----------"
---        BL.putStr "Full msg:"
---        BL.putStrLn message
-        let parsedMsg = A.eitherDecode message :: Either String SMessage
-        case parsedMsg of
-          Left msg -> error $ "Problem parsing: " ++ msg
-          Right parsedResult -> do
-            let maybeClientSideMsgs = (parseClientSideMsg parsedResult)
-            let r = fmap (\z -> mfilter (\x -> (methodName x) /= "updateSummaryState") z) maybeClientSideMsgs
-            case r of
-              Nothing -> putStrLn $ "Unknown message" ++ (show message)
-              Just xs -> do
-                BL.putStrLn $ BL.take 1500 $ BL.concat $ map show3 xs
-                let deltas = map parseDelta xs
-                putStrLn $ take 1500 $ concat $ map show deltas 
-  
-        putStrLn "------- Message End ---------------"
+--        putStrLn "------- Message Received ----------"
+        let eitherBtrMsg = (decodeToSMsg message) >>= decodeSMsg
+        case eitherBtrMsg of
+          Left err -> putStrLn $ "Failed to decode message from server" ++ err
+          Right btrMsg ->
+            case btrMsg of
+              BtrMsgState state -> putStrLn $ "State msg: n=" ++ (show $ btrStateNounce state)
+              BtrMsgDelta delta -> putStrLn $ "Delta msg: n=" ++ (show $ btrDeltaNounce delta) ++ " market = " ++ (T.unpack $ btrDeltaMarketName delta)
+--        putStrLn "------- Message End ---------------"
     let loop = do
             line <- getLine
             unless (null line) $ do
@@ -108,3 +107,33 @@ ws connection = do
 
     sendClose connection (pack "Bye!")
 
+
+parseClientSideMsg :: SMessage -> Maybe [ClientSideMsg]
+parseClientSideMsg smsg = (m smsg) >>= parseMaybe parseJSON   
+
+parseDelta :: ClientSideMsg -> Either String [BtrDelta]
+parseDelta csm
+  | method == "updateExchangeState" = parseEither parseJSON (args csm)
+  | otherwise = Left $ "Unknown methodName " ++ (T.unpack method) ++ ". Expected updateExchangeState for incoming Delta"
+  where method = methodName csm
+
+
+parseState :: SMessageResult -> Either String BtrState
+parseState smr = parseEither parseJSON (fromJust $ r smr)
+
+decodeToSMsg :: BL.ByteString -> Either String SMsg  
+decodeToSMsg rawMessage = A.eitherDecode rawMessage 
+
+-- | Function to decode SMsg. Be carefull may lose some messages because it takes only first element od response array. Because so far I havent sean bigger arrays.
+decodeSMsg :: SMsg -> Either String BtrMsg
+decodeSMsg smsg = case smsg of
+  SMsg smessage ->
+    let maybeClientSideMsg = (parseClientSideMsg smessage) >>= listToMaybe
+        in case maybeClientSideMsg of
+           Nothing -> Left $ "Failed to decode smessage:" ++ (show smessage)
+           Just csm -> case parseDelta csm of
+                         Left err -> Left $ "Failed decoding delta from clientSideMsg: " ++ err
+                         Right (x:xs) -> Right $ BtrMsgDelta x
+  SMsgR smr ->
+    let state = parseState smr
+        in fmap BtrMsgState state

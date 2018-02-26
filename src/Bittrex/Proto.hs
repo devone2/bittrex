@@ -22,7 +22,7 @@ import qualified Data.ByteString.Lazy.Char8 as BL
 data SMsg = SMsg SMessage | SMsgR SMessageResult
   deriving (Generic, Show)
 
--- | Message from in form of broadcasted message
+-- | Message from server in form of broadcasted message
 data SMessage = SMessage {
     s :: Maybe Integer
   , m :: Maybe Value
@@ -31,7 +31,7 @@ data SMessage = SMessage {
 
 -- | Message from server as response to call
 data SMessageResult = SMessageResult {
-    r :: Maybe String
+    r :: Maybe Value
   , i :: Maybe Integer
 } deriving (Generic, Show)
 
@@ -81,29 +81,29 @@ instance FromJSON ClientSideMsg where
     <*> v .: "A"
     
 
-data BtrOrder = BtrOrder {
-   btrOrdQuantity :: Double
- , btrOrdRate :: Double
- , btrOrdType :: Int
+data BtrOrderD = BtrOrderD {
+   btrOrdDQuantity :: Double
+ , btrOrdDRate :: Double
+ , btrOrdDType :: Int
 } deriving (Generic, Show)
 
 
-instance FromJSON BtrOrder where
-  parseJSON = withObject "BtrOrder" $ \v -> BtrOrder
+instance FromJSON BtrOrderD where
+  parseJSON = withObject "BtrOrderD" $ \v -> BtrOrderD
     <$> v .: "Quantity"
     <*> v .: "Rate"
     <*> v .: "Type"
 
-data BtrFill = BtrFill {
-   btrFillQuantity :: Double
- , btrFillOrderType :: Text
- , btrFillOrderRate :: Double
- , btrFillOrderTimestamp :: Text
+data BtrFillD = BtrFillD {
+   btrFillDQuantity :: Double
+ , btrFillDOrderType :: Text
+ , btrFillDOrderRate :: Double
+ , btrFillDOrderTimestamp :: Text
 } deriving (Generic, Show)
 
 
-instance FromJSON BtrFill where
-  parseJSON = withObject "BtrFill" $ \v -> BtrFill
+instance FromJSON BtrFillD where
+  parseJSON = withObject "BtrFillD" $ \v -> BtrFillD
     <$> v .: "Quantity"
     <*> v .: "OrderType"
     <*> v .: "Rate"
@@ -112,9 +112,9 @@ instance FromJSON BtrFill where
 data BtrDelta = BtrDelta {
    btrDeltaNounce :: Int
  , btrDeltaMarketName :: Text
- , btrDeltaSells :: [BtrOrder]
- , btrDeltaFills :: [BtrFill]
- , btrDeltaBuys :: [BtrOrder]
+ , btrDeltaSells :: [BtrOrderD]
+ , btrDeltaFills :: [BtrFillD]
+ , btrDeltaBuys :: [BtrOrderD]
 } deriving (Generic, Show)
 
 
@@ -125,4 +125,50 @@ instance FromJSON BtrDelta where
     <*> v .: "Sells"
     <*> v .: "Fills"
     <*> v .: "Buys"
+  
+data BtrOrder = BtrOrder {
+   btrOrdQuantity :: Double
+ , btrOrdRate :: Double
+} deriving (Generic, Show)
 
+instance FromJSON BtrOrder where
+  parseJSON = withObject "BtrOrder" $ \v -> BtrOrder
+    <$> v .: "Quantity"
+    <*> v .: "Rate"
+
+data BtrFill = BtrFill {
+   btrFillType :: Text
+ , btrFillQuantity :: Double
+ , btrFillOrderType :: Text
+ , btrFillTotal :: Double
+ , btrFillPrice :: Double
+ , btrFillId :: Integer
+ , btrFillOrderTimestamp :: Text
+} deriving (Generic, Show)
+
+instance FromJSON BtrFill where
+  parseJSON = withObject "BtrFill" $ \v -> BtrFill
+    <$> v .: "FillType"
+    <*> v .: "Quantity"
+    <*> v .: "OrderType"
+    <*> v .: "Total"
+    <*> v .: "Price"
+    <*> v .: "Id"
+    <*> v .: "TimeStamp"
+
+data BtrState = BtrState {
+    btrStateNounce :: Int
+  , btrStateSells :: [BtrOrder]
+  , btrStateFills :: [BtrFill]
+  , btrStateBuys :: [BtrOrder]
+} deriving (Generic, Show)
+
+instance FromJSON BtrState where
+  parseJSON = withObject "BtrState" $ \v -> BtrState
+    <$> v .: "Nounce"
+    <*> v .: "Sells"
+    <*> v .: "Fills"
+    <*> v .: "Buys"
+ 
+
+data BtrMsg = BtrMsgState BtrState | BtrMsgDelta BtrDelta
