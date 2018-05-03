@@ -16,6 +16,8 @@ main :: IO ()
 main = do
   putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
   runSecureClient "socket.bittrex.com"  443 (exportURL relativeUrl) ws
+  putStrLn "Finished"
+   
 
 relativeUrl = URL HostRelative "/signalr/connect" socketParams
 

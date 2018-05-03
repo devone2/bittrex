@@ -15,7 +15,14 @@ import           Data.Aeson.Types
 import qualified Data.Attoparsec.ByteString as ABS
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL
-
+import           Data.Scientific
+import           Data.Binary
+import           Data.Binary.Get (ByteOffset)
+import           System.IO
+import           Control.Monad
+import           Data.Time.Clock
+import           Util (asRational)
+import           Model.MarketModel
 {-- Great aeson guide https://artyom.me/aeson --}
 
 -- | Sum type of all possible messages from server we can receive (not complete yet)
@@ -32,7 +39,7 @@ data SMessage = SMessage {
 -- | Message from server as response to call
 data SMessageResult = SMessageResult {
     r :: Maybe Value
-  , i :: Maybe Integer
+  , i :: Maybe String
 } deriving (Generic, Show)
 
 -- JSON parsers for above types. TODO: Rewrite SMsg parser using asum or <|> alternative parser} 
@@ -68,10 +75,11 @@ data ServerSideMsg = ServerSideMsg {
   srvSideMsgHub :: Text
   ,srvSideMsgMethod :: Text
   ,srvSideMsgArgs :: Value
+  ,srvSideMsgInvIdent :: String
 } deriving (Generic, Show)
 
 instance ToJSON ServerSideMsg where
-  toJSON m = object ["H" .= (srvSideMsgHub m), "M" .= (srvSideMsgMethod m), "A" .= (srvSideMsgArgs m)]
+  toJSON m = object ["H" .= (srvSideMsgHub m), "M" .= (srvSideMsgMethod m), "A" .= (srvSideMsgArgs m), "I" .= (srvSideMsgInvIdent m)]
 
    
 instance FromJSON ClientSideMsg where
@@ -82,31 +90,30 @@ instance FromJSON ClientSideMsg where
     
 
 data BtrOrderD = BtrOrderD {
-   btrOrdDQuantity :: Double
- , btrOrdDRate :: Double
+   btrOrdDQuantity :: Rational
+ , btrOrdDRate :: Rational
  , btrOrdDType :: Int
-} deriving (Generic, Show)
-
+} deriving (Eq, Generic, Show)
 
 instance FromJSON BtrOrderD where
   parseJSON = withObject "BtrOrderD" $ \v -> BtrOrderD
-    <$> v .: "Quantity"
-    <*> v .: "Rate"
+    <$> asRational (v .: "Quantity")
+    <*> asRational (v .: "Rate")
     <*> v .: "Type"
 
 data BtrFillD = BtrFillD {
-   btrFillDQuantity :: Double
+   btrFillDQuantity :: Rational
  , btrFillDOrderType :: Text
- , btrFillDOrderRate :: Double
+ , btrFillDOrderRate :: Rational
  , btrFillDOrderTimestamp :: Text
-} deriving (Generic, Show)
+} deriving (Eq, Generic, Show)
 
 
 instance FromJSON BtrFillD where
   parseJSON = withObject "BtrFillD" $ \v -> BtrFillD
-    <$> v .: "Quantity"
+    <$> asRational (v .: "Quantity")
     <*> v .: "OrderType"
-    <*> v .: "Rate"
+    <*> asRational (v .: "Rate")
     <*> v .: "TimeStamp"
 
 data BtrDelta = BtrDelta {
@@ -126,33 +133,28 @@ instance FromJSON BtrDelta where
     <*> v .: "Fills"
     <*> v .: "Buys"
   
-data BtrOrder = BtrOrder {
-   btrOrdQuantity :: Double
- , btrOrdRate :: Double
-} deriving (Generic, Show)
-
 instance FromJSON BtrOrder where
   parseJSON = withObject "BtrOrder" $ \v -> BtrOrder
-    <$> v .: "Quantity"
-    <*> v .: "Rate"
+    <$> asRational (v .: "Quantity")
+    <*> asRational (v .: "Rate")
 
 data BtrFill = BtrFill {
    btrFillType :: Text
- , btrFillQuantity :: Double
+ , btrFillQuantity :: Rational
  , btrFillOrderType :: Text
- , btrFillTotal :: Double
- , btrFillPrice :: Double
+ , btrFillTotal :: Rational
+ , btrFillPrice :: Rational
  , btrFillId :: Integer
  , btrFillOrderTimestamp :: Text
-} deriving (Generic, Show)
+} deriving (Eq, Generic, Show)
 
 instance FromJSON BtrFill where
   parseJSON = withObject "BtrFill" $ \v -> BtrFill
     <$> v .: "FillType"
-    <*> v .: "Quantity"
+    <*> asRational (v .: "Quantity")
     <*> v .: "OrderType"
-    <*> v .: "Total"
-    <*> v .: "Price"
+    <*> asRational (v .: "Total")
+    <*> asRational (v .: "Price")
     <*> v .: "Id"
     <*> v .: "TimeStamp"
 
@@ -161,7 +163,7 @@ data BtrState = BtrState {
   , btrStateSells :: [BtrOrder]
   , btrStateFills :: [BtrFill]
   , btrStateBuys :: [BtrOrder]
-} deriving (Generic, Show)
+} deriving (Eq, Generic, Show)
 
 instance FromJSON BtrState where
   parseJSON = withObject "BtrState" $ \v -> BtrState
@@ -171,4 +173,51 @@ instance FromJSON BtrState where
     <*> v .: "Buys"
  
 
-data BtrMsg = BtrMsgState BtrState | BtrMsgDelta BtrDelta
+data BtrMsg = BtrMsgState String BtrState | BtrMsgDelta BtrDelta deriving (Generic, Show)
+instance Binary BtrOrder
+instance Binary BtrFill
+instance Binary BtrOrderD
+instance Binary BtrFillD
+instance Binary BtrState
+instance Binary BtrDelta
+instance Binary BtrMsg
+
+data TimedMsg = TimedMsg Integer BtrMsg deriving (Generic, Show)
+instance Binary TimedMsg
+
+{-- Convert to MarketModel functions --}
+updateOrder :: BtrOrderD -> MarketOrders -> MarketOrders
+updateOrder delta market
+  | t == 0 = addOrder o market
+  | t == 1 = deleteOrder o market
+  | t == 2 = replaceOrder o market 
+  where o = BtrOrder (btrOrdDQuantity delta) (btrOrdDRate delta)
+        t = btrOrdDType delta
+
+updateMarketOrder :: BtrOrderType -> BtrOrderD -> Market -> Market
+updateMarketOrder t o m
+  | t == Ask = m { asks = updateOrder o (asks m)}
+  | t == Bid = m { bids = updateOrder o (bids m)}
+
+
+
+showDataLog = 
+  withFile "data.log" ReadMode $ \handle -> do
+    content <- BL.hGetContents handle
+    let msgs = decodeR content
+    foldM (\n (TimedMsg ts m) -> do
+              let nn = nounce m
+              when ((n + 1) /= nn) $
+                putStrLn $ "Lost nounce sync at " ++ (show n) ++ " to " ++ (show nn)
+              return nn) 0 msgs
+
+    where nounce (BtrMsgState _ s) = btrStateNounce s
+          nounce (BtrMsgDelta d) = btrDeltaNounce d
+
+decodeR :: BL.ByteString -> [TimedMsg]
+decodeR c
+  | BL.null c = []
+  | otherwise = let parsed = decodeOrFail c :: Either (BL.ByteString, ByteOffset, String) (BL.ByteString, ByteOffset, TimedMsg)
+  in case parsed of
+       Left (rest, offset, err) -> error $ ("Error when decoding input: " ++ err)
+       Right (rest, offset, msg) -> msg : decodeR rest
