@@ -2,7 +2,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
-module Bittrex.Watcher where
+module Bittrex.Conduit where
 import           Bittrex.Proto
 import           Model.MarketModel
 import           Control.Concurrent (forkIO)
@@ -25,7 +25,7 @@ import qualified Data.Text as T
 import           Text.Printf
 import Control.Monad
 import Control.Concurrent.MVar
-import           Control.Concurrent
+--import           Control.Concurrent
 import qualified Debug.Trace as D
 import           System.IO
 import           Data.Binary (encode)
@@ -34,43 +34,68 @@ import qualified Data.Map as M
 import           Data.List (intersect, union)
 import           Control.Concurrent.Chan
 import           Conduit
+import qualified Data.Conduit.List as CL
+import           Data.IORef
+
 {-
 TODO:
 1. import receiving data for multiple markets at the same time
    - maintain map with markets
    - maintain map with invocation to market
    - update correct market
-
-2. calculate possible arb for all markets X for this: (BTC->ETH->X->BTC)
-
 -}
 
-btcCoins = ["TRX", "XVG", "ADA", "ETH", "XEM", "XRP", "XLM", "NEO", "NBT", "UP", "BCC", "LTC", "LRC", "SC", "TUSD", "SLS", "QTUM", "ETC", "RDD", "XMR", "ADT", "ZEC", "STRAT", "VTC", "SALT", "LSK", "DASH", "BTG", "OMG", "DGB", "RVR", "AMP", "ENG", "SNT", "DOGE", "SRN", "ARK", "NXS", "STEEM", "FTC", "XDN", "PAY", "ZCL", "KORE", "BAT", "ARDR", "VEE", "WAVES", "FCT", "POWR", "VIA", "SYS", "MANA", "BCPT", "GAME", "STORJ", "EMC2", "KMD", "XZC", "MCO", "UNB", "WAX", "NXT", "TX", "EDG", "BAY", "IGNIS", "REP", "ADX", "ZEN", "GBYTE", "BITB", "PIVX", "RLC", "RCN", "HMQ", "DCR", "ION", "GRS", "LBC", "EXP", "SBD", "CVC", "BLOCK", "MONA", "BLK", "MUE", "CFI", "PKB", "ZRX", "XCP", "ANT", "PART", "QRL", "BURST", "DNT", "UKG", "DOPE", "VRC", "GNT", "SWT", "VIB", "NMR", "WINGS", "XEL", "SLR", "SHIFT", "GCR", "THC", "OK", "PDC", "MEME", "CPC", "GUP", "TIX", "UBQ", "CLOAK", "IOP", "SIB", "LUN", "LMC", "NAV", "DYN", "MER", "GOLOS", "FAIR", "SPHR", "NLG", "POT", "GNO", "DCT", "ENRG", "INCNT", "RADS", "PPC", "MUSIC", "XMY", "PTOY", "EMC", "BNT", "EBST", "SEQ", "BSD", "XWC", "EXCL", "CANN", "START", "AEON", "GLD", "GEO", "TRST", "LGD", "CRW", "DMD", "COVAL", "CRB", "GAM", "SYNX", "DTB", "IOC", "NEOS", "XVC", "VRM", "EFL", "XMG", "SWIFT", "AUR", "GRC", "TRUST", "QWARK", "SPR", "FLDC", "EGC", "FLO", "ABY", "BCY", "RBY", "PINK", "BRK", "VTR", "CLAM", "TKS", "OMNI", "BLITZ", "NXC", "MLN", "CURE", "PTC", "XST", "GBG", "BYC", "2GIVE", "BRX", "SNRG", "ERC", "CLUB"]
-
-ethCoins = ["ADA", "BCC", "XEM", "QTUM", "NEO", "LTC", "XRP", "OMG", "XMR", "MCO", "TRX", "WAX", "DASH", "SRN", "ZEC", "SC", "DGB", "XLM", "CVC", "ETC", "REP", "NMR", "PAY", "RLC", "POWR", "STRAT", "GNT", "ZRX", "HMQ", "SNT", "BTG", "CFI", "ADX", "BAT", "TRST", "WAVES", "MANA", "BCPT", "ENG", "WINGS", "LRC", "FCT", "VEE", "DNT", "RCN", "SALT", "TIX", "UKG", "BNT", "STORJ", "QRL", "ANT", "ADT", "PTOY", "GUP", "GNO", "LUN", "CRB", "VIB", "LGD"]
-
---coins = btcCoins `union` ethCoins
-coins = ["XMR"]
---main :: IO ()
-
 mainSimple = do
+  let marketList = [("ETH", "BTC")] --,("BCC", "BTC"),("ETH", "BTC")]
+
   c <- newChan
-  forkIO $ forever $ watchOrderBook c
-  forever $ do
-    (Exchange exName exMap) <- readChan c
+  forkIO $ forever $ watchOrderBook marketList c
+
+  runConduit $ sourceChan c
+    .| CL.mapM_ displayPrice
+  
+--  forever $ do
+--    tm@(TimedMsg t msg) <- readChan c
 --    let xmr_btc = M.
 --    putStrLn $ "OrderBook: " ++ 
-    putStrLn $ "Got update for exchange = " ++ (show exName) ++ " with number of pairs: " ++ (show $ length $ M.keys exMap)
+--    putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] msg: " ++ (take 20 $ show msg)
+--    displayPrice tm
+
+displayPrice (TimedMsg t msg) = 
+  case msg of
+      BtrMsgDelta delta -> do
+        let fills = btrDeltaFills delta
+        when (not $ null fills) $ do
+          putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] price: " ++ (fmtMoney $ safeHead $ map btrFillDOrderRate fills)
+          
+      BtrMsgState i state -> do
+        let fills = btrStateFills state
+        when (not $ null fills) $ do
+          putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] price: " ++ (fmtMoney $ safeHead $ map btrFillPrice fills)
+ 
+
+sourceChan :: Chan a -> ConduitT () a IO ()
+sourceChan chan = loop
+  where loop = do
+          value <- lift $ readChan chan
+          yield value
+          loop
 
 
-watchOrderBook chan = do
+safeHead [] = Nothing
+safeHead (x:xs) = Just x
+fmtMoney Nothing = "nothing"
+fmtMoney (Just n) = printf "%.8F" $ (fromRational n :: Double)
+
+epochToUTC = posixSecondsToUTCTime . fromIntegral
+watchOrderBook marketList chan = do
   putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
   cf <- readCloudFlare
   putStrLn $ "Using cf:" ++ (show cf)
   let options = defaultConnectionOptions
   let headers = [("Cookie", BS.pack (cookies cf))
                 ,("User-Agent", BS.pack (userAgent cf))] 
-  runSecureClientWith "socket.bittrex.com" 443 (exportURL relativeUrl) options headers $ ws chan
+  runSecureClientWith "socket.bittrex.com" 443 (exportURL relativeUrl) options headers $ ws marketList chan
   
   putStrLn "Finished"
   putStrLn $ exportURL relativeUrl 
@@ -104,31 +129,17 @@ instance FromJSON CloudFlare
 subscribeToExchangeDeltas pair = ServerSideMsg "corehub" "SubscribeToExchangeDeltas" (toJSON [toBittrexPair pair]) "-1"
 queryExchangeState pair = ServerSideMsg "corehub" "QueryExchangeState" (toJSON [pair])
 
-
  
-show2 smsg = encodePretty $ m smsg
+--show2 smsg = encodePretty $ m smsg
 
 show3 :: ClientSideMsg -> BL.ByteString
 show3 csm = encodePretty $ args csm
 
 
-loadMarket :: BtrState -> Market
-loadMarket s = let m = emptyMarket "BTC-EUR"
-                   m1 = foldl (\m' x -> addMarketOrder Ask x m') m (btrStateSells s)
-               in foldl (\m' x -> addMarketOrder Bid x m') m1 (btrStateBuys s)
-
-updateMarket :: Market -> BtrDelta -> Market
-updateMarket m d = let m1 = foldl (\m' x -> updateMarketOrder Ask x m') m (btrDeltaSells d)
-                   in foldl (\m' x -> updateMarketOrder Bid x m') m1 (btrDeltaBuys d)
-
 queryExState connection marketName i = do
     let queryCommand = A.encode $ queryExchangeState (toBittrexPair marketName) i
-    --BL.putStrLn queryCommand
     sendTextData connection queryCommand
 
---marketList = [("ETH", "BTC")] `union` (map (\m -> (m, "BTC")) coins) `union` (map (\m -> (m, "ETH")) coins)
-
-marketList = [("XMR", "BTC")]
 
 toBittrexPair (fx,base) = base ++ "-" ++ fx
 fromBittrexPair s = let (bs, fxs) = break (=='-') s
@@ -136,15 +147,17 @@ fromBittrexPair s = let (bs, fxs) = break (=='-') s
 data BtrControl = BtrControl Integer Integer
 
 
-type MarketMap = M.Map String (Int, Market)
 
-ws :: Chan Exchange -> ClientApp ()
-ws chan connection = do
+ws :: [ExPair] -> Chan TimedMsg -> ClientApp ()
+ws marketList chan connection = do
     putStrLn "Connected!"
     putStrLn "Requesting exchangeDeltas"
 
-    marketsMVar <- newMVar $ M.fromList $ map (\m ->(m, (0, emptyMarket $ show m))) marketList
-    invMVar <- newMVar $ M.empty :: IO (MVar (M.Map String ExPair))
+    -- M.Map String ExPair
+    invIORef <- newIORef $ M.empty  :: IO (IORef (M.Map String ExPair))
+
+    -- M.Map ExPair Int - map from pair to last nounce
+    nouncesIORef <- newIORef $ M.empty :: IO (IORef (M.Map ExPair Int))
 
     mapM_ (\m -> do
               let q = A.encode $ subscribeToExchangeDeltas m 
@@ -152,62 +165,50 @@ ws chan connection = do
               sendTextData connection q
           ) marketList 
 
-    forever $ withFile "data.log" AppendMode $ \handle -> do
+    forever $ do
         message <- (receiveData connection) :: IO BL.ByteString
         let eitherBtrMsg = (decodeToSMsg message) >>= decodeSMsg
         case eitherBtrMsg of
           Left err -> putStrLn $ "Failed to decode message from server" ++ err
           Right btrMsg -> do
             now <- round `fmap` getPOSIXTime
-            BL.hPut handle (encode $ TimedMsg now btrMsg)
             case btrMsg of
               BtrMsgState i state -> do
                 putStrLn $ show $ map btrFillOrderTimestamp $ btrStateFills state
-                updateFullState marketsMVar invMVar i state 
+                invMap <- readIORef invIORef
+                let marketName = invMap M.! i
+                modifyIORef nouncesIORef (M.alter (\_ -> Just $ btrStateNounce state) marketName)
+                writeChan chan $ TimedMsg now btrMsg
               BtrMsgDelta delta -> do
-                updateDeltaState connection marketsMVar invMVar delta
-                mts <- readMVar marketsMVar
-                writeChan chan $ Exchange Bittrex $ M.map (\(_,m) -> m) mts
+                nounces <- readIORef nouncesIORef
+                let currentNounce = btrDeltaNounce delta
+                    marketName = marketNameD delta
+                    lastNounce = nounces M.!? marketName
+                if not ((currentNounce - 1) `elem` lastNounce) then do
+                  -- we are out of sync with server -> we will requests full state
+                  queryFullState connection invIORef marketName
+                else do
+                  -- just update last nounce
+                  modifyIORef nouncesIORef (M.update (\_ -> Just currentNounce) marketName)
+                  writeChan chan $ TimedMsg now btrMsg
+
 --  TODO: vymysliet ako zavriet socket ked skonci thready
 --  sendClose connection (pack "Bye!")
     putStrLn "Main thread goind to sleep"
-    forever $ threadDelay (1000 * 50)
 
+marketNameD :: BtrDelta -> ExPair
+marketNameD delta = fromBittrexPair $ T.unpack $ btrDeltaMarketName delta
 
        
 maybeTuple (Just a, Just b) = Just (a,b)
 maybeTuple (_, _) = Nothing
 
-updateFullState marketsMVar invMVar i state = do
-  invMap <- readMVar invMVar
-  let marketName = invMap M.! i
-  modifyMVar_ marketsMVar (\marketsMap ->
-                              return $ M.alter (\_ -> Just (btrStateNounce state, loadMarket state)) marketName marketsMap)
-
---updateDeltaState :: a -> MVar (M.Map ExPair (Int,Market)) -> MVar (M.Map String ExPair) -> BtrDelta -> IO ()
-updateDeltaState connection marketsMVar invMVar delta = do
-  let marketName = fromBittrexPair $ T.unpack $ btrDeltaMarketName delta
-  modifyMVar_ marketsMVar (\marketsMap -> do
-                              let (lastNounce, market) = (marketsMap M.! marketName)
-                              when (lastNounce+1 /= (btrDeltaNounce delta)) $ do
-                                queryFullState connection invMVar marketName
-                                --putStrLn ("Lost sync with exchange at old nounce = " ++ (show lastNounce))
-                              return $ M.update (\_-> Just (btrDeltaNounce delta, updateMarket market delta)) marketName marketsMap)
-
---queryFullState :: a -> MVar (M.Map String ExPair) -> ExPair -> IO ()
-queryFullState connection invMVar marketName = do
-  modifyMVar_ invMVar (\invMap -> do 
-                          let ks = map read (M.keys invMap) :: [Integer]
-                          let i = show $ 1 + (if null ks then 0 else maximum ks)
-                          queryExState connection marketName i
-                          return $ M.insert i marketName invMap)
-
-showMarket m = let (minAsk, maxBid) = getAskBid m
-               in "Bid = " ++ (formatNumber maxBid) ++ "\n" ++
-                  "Ask = " ++ (formatNumber minAsk) ++ "\n" ++
-                  "Spr = " ++ (formatNumber ((-) <$> minAsk <*> maxBid))
-           where formatNumber Nothing = "nothing"
-                 formatNumber (Just n) = printf "%.8F" (fromRational n :: Double)
+queryFullState connection invIORef marketName = do
+  invMap <- readIORef invIORef
+  let ks = map read (M.keys invMap) :: [Integer]
+      i = show $ 1 + (if null ks then 0 else maximum ks)
+  modifyIORef invIORef (M.insert i marketName)
+  queryExState connection marketName i
 
 parseClientSideMsg :: SMessage -> Maybe [ClientSideMsg]
 parseClientSideMsg smsg = (m smsg) >>= parseMaybe parseJSON   
@@ -238,5 +239,4 @@ decodeSMsg smsg = case smsg of
   SMsgR smr ->
     let state = {--D.trace ("SMessageResult: " ++ (show smr)) $--} parseState smr
         in fmap (BtrMsgState $ fromMaybe "-2" (i smr)) state
-
 
