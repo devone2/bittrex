@@ -23,6 +23,11 @@ import           Control.Monad
 import           Data.Time.Clock
 import           Util (asRational)
 import           Model.MarketModel
+import           Data.Time.Format (formatTime, parseTimeM, defaultTimeLocale)
+import           Data.Text (unpack)
+import           Data.Time.Clock 
+import           Data.Time.Format
+
 {-- Great aeson guide https://artyom.me/aeson --}
 
 -- | Sum type of all possible messages from server we can receive (not complete yet)
@@ -88,7 +93,24 @@ instance FromJSON ClientSideMsg where
     <*> v .: "M"
     <*> v .: "A"
     
+data UTCTimeNoZ = UTCTimeNoZ {
+  fromUTCTimeNoZ :: UTCTime
+} deriving (Show, Eq)
 
+
+instance ToJSON UTCTimeNoZ where
+    toJSON t = String (pack (take 23 str ++ "Z"))
+      where str = formatTime defaultTimeLocale "%FT%T%Q" (fromUTCTimeNoZ t)
+    {-# INLINE toJSON #-}
+
+instance FromJSON UTCTimeNoZ where
+    parseJSON = withText "UTCTime" $ \t ->
+        case parseTimeM True defaultTimeLocale "%FT%T%Q" (unpack t) of
+          Just d -> pure $ UTCTimeNoZ d
+          _      -> fail $ "could not parse ISO-8601 date without Z:" ++ (unpack t) 
+    {-# INLINE parseJSON #-}
+
+    
 data BtrOrderD = BtrOrderD {
    btrOrdDQuantity :: Rational
  , btrOrdDRate :: Rational
@@ -105,7 +127,7 @@ data BtrFillD = BtrFillD {
    btrFillDQuantity :: Rational
  , btrFillDOrderType :: Text
  , btrFillDOrderRate :: Rational
- , btrFillDOrderTimestamp :: Text
+ , btrFillDOrderTimestamp :: UTCTime
 } deriving (Eq, Generic, Show)
 
 
@@ -114,7 +136,7 @@ instance FromJSON BtrFillD where
     <$> asRational (v .: "Quantity")
     <*> v .: "OrderType"
     <*> asRational (v .: "Rate")
-    <*> v .: "TimeStamp"
+    <*> (fromUTCTimeNoZ <$> (v .: "TimeStamp"))
 
 data BtrDelta = BtrDelta {
    btrDeltaNounce :: Int
@@ -145,7 +167,7 @@ data BtrFill = BtrFill {
  , btrFillTotal :: Rational
  , btrFillPrice :: Rational
  , btrFillId :: Integer
- , btrFillOrderTimestamp :: Text
+ , btrFillOrderTimestamp :: UTCTime
 } deriving (Eq, Generic, Show)
 
 instance FromJSON BtrFill where
@@ -156,24 +178,48 @@ instance FromJSON BtrFill where
     <*> asRational (v .: "Total")
     <*> asRational (v .: "Price")
     <*> v .: "Id"
-    <*> v .: "TimeStamp"
+    <*> (fromUTCTimeNoZ <$> (v .: "TimeStamp"))
 
+-- BtrState as returne from bittrex but market name added 
 data BtrState = BtrState {
-    btrStateNounce :: Int
+    btrStateMarketName :: ExPair
+  , btrStateNounce :: Int
   , btrStateSells :: [BtrOrder]
   , btrStateFills :: [BtrFill]
   , btrStateBuys :: [BtrOrder]
 } deriving (Eq, Generic, Show)
 
-instance FromJSON BtrState where
-  parseJSON = withObject "BtrState" $ \v -> BtrState
+mkBtrState market s = BtrState market
+                        (btrStateNounceNM s)
+                        (btrStateSellsNM s)
+                        (btrStateFillsNM s)
+                        (btrStateBuysNM s)
+
+-- State as returned form Bittrex (missing name of market)
+data BtrStateNoMarket = BtrStateNoMarket {
+    btrStateNounceNM :: Int
+  , btrStateSellsNM :: [BtrOrder]
+  , btrStateFillsNM :: [BtrFill]
+  , btrStateBuysNM :: [BtrOrder]
+} deriving (Eq, Generic, Show)
+
+instance FromJSON BtrStateNoMarket where
+  parseJSON = withObject "BtrStateNoMarket" $ \v -> BtrStateNoMarket
     <$> v .: "Nounce"
     <*> v .: "Sells"
     <*> v .: "Fills"
     <*> v .: "Buys"
- 
 
-data BtrMsg = BtrMsgState String BtrState | BtrMsgDelta BtrDelta deriving (Generic, Show)
+data BtrMsg = BtrMsgState BtrState
+  | BtrMsgDelta BtrDelta
+  deriving (Generic, Show)
+
+
+data BtrMsgParsed = BtrMsgParsedState String BtrStateNoMarket
+  | BtrMsgParsedDelta BtrDelta
+  deriving (Generic, Show)
+
+
 instance Binary BtrOrder
 instance Binary BtrFill
 instance Binary BtrOrderD
@@ -181,6 +227,17 @@ instance Binary BtrFillD
 instance Binary BtrState
 instance Binary BtrDelta
 instance Binary BtrMsg
+instance Binary UTCTime where
+  get = parse <$> (get :: Get String)
+    where parse t = case parseTimeM True defaultTimeLocale "%FT%T%Q" t of
+            Just d -> d :: UTCTime
+            _      -> error $ "could not parse ISO-8601 date without Z:" ++ t 
+
+  
+  put = put . formatTime defaultTimeLocale standardFormat
+
+
+standardFormat = "%FT%T%Q"
 
 data TimedMsg = TimedMsg Integer BtrMsg deriving (Generic, Show)
 instance Binary TimedMsg
@@ -211,7 +268,7 @@ showDataLog =
                 putStrLn $ "Lost nounce sync at " ++ (show n) ++ " to " ++ (show nn)
               return nn) 0 msgs
 
-    where nounce (BtrMsgState _ s) = btrStateNounce s
+    where nounce (BtrMsgState s) = btrStateNounce s
           nounce (BtrMsgDelta d) = btrDeltaNounce d
 
 decodeR :: BL.ByteString -> [TimedMsg]

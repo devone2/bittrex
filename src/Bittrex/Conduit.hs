@@ -34,9 +34,13 @@ import qualified Data.Map as M
 import           Data.List (intersect, union)
 import           Control.Concurrent.Chan
 import           Conduit
-import qualified Data.Conduit.List as CL
-import           Data.IORef
 
+import qualified Data.Conduit.List as CL
+import qualified Data.Conduit.Combinators as CC
+
+import           Data.IORef
+import           Data.Time.Clock (UTCTime)
+import qualified Data.Time.Format as TF
 {-
 TODO:
 1. import receiving data for multiple markets at the same time
@@ -52,8 +56,23 @@ mainSimple = do
   forkIO $ forever $ watchOrderBook marketList c
 
   runConduit $ sourceChan c
-    .| CL.mapM_ displayPrice
+    .| CC.map extractPrice
+    .| CC.filter isJust
+    .| CL.mapM_ (displayTicker . fromJust)
   
+mainSimpleBtr = do
+  let marketList = [("ETH", "BTC"),("BCC", "BTC"),("XMR", "BTC")]
+
+  c <- newChan
+  forkIO $ forever $ watchOrderBook marketList c
+
+  runConduit $ sourceChan c
+    .| CL.mapM_ (displayBtr)
+
+displayBtr (TimedMsg t (BtrMsgDelta delta)) = putStrLn $ unwords [showTs t, " delta of market: ", show $ btrDeltaMarketName delta]
+displayBtr (TimedMsg t (BtrMsgState state)) = putStrLn $ unwords [showTs t, " state of market: ", show $ btrStateMarketName state]
+
+showTs t = "[" ++ (show t) ++ "]"
 --  forever $ do
 --    tm@(TimedMsg t msg) <- readChan c
 --    let xmr_btc = M.
@@ -61,18 +80,20 @@ mainSimple = do
 --    putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] msg: " ++ (take 20 $ show msg)
 --    displayPrice tm
 
-displayPrice (TimedMsg t msg) = 
+data Ticker = Ticker UTCTime Double 
+
+displayTicker (Ticker t p) =
+  putStrLn $ "[" ++ (show t) ++ "] price: " ++ (fmtMoney p)
+
+
+extractPrice (TimedMsg t msg) = 
   case msg of
-      BtrMsgDelta delta -> do
-        let fills = btrDeltaFills delta
-        when (not $ null fills) $ do
-          putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] price: " ++ (fmtMoney $ safeHead $ map btrFillDOrderRate fills)
-          
-      BtrMsgState i state -> do
-        let fills = btrStateFills state
-        when (not $ null fills) $ do
-          putStrLn $ "[" ++ (show $ epochToUTC t) ++ "] price: " ++ (fmtMoney $ safeHead $ map btrFillPrice fills)
- 
+      BtrMsgDelta delta -> 
+        let lastFill = safeHead $ btrDeltaFills delta
+        in Ticker <$> (btrFillDOrderTimestamp <$> lastFill) <*> (fromRational <$> btrFillDOrderRate <$> lastFill)
+      BtrMsgState state -> 
+        let lastFill = safeHead $ btrStateFills state
+        in Ticker <$> (btrFillOrderTimestamp <$> lastFill) <*> (fromRational <$> btrFillPrice <$> lastFill)
 
 sourceChan :: Chan a -> ConduitT () a IO ()
 sourceChan chan = loop
@@ -84,10 +105,14 @@ sourceChan chan = loop
 
 safeHead [] = Nothing
 safeHead (x:xs) = Just x
-fmtMoney Nothing = "nothing"
-fmtMoney (Just n) = printf "%.8F" $ (fromRational n :: Double)
+
+fmtMoneyM Nothing = "nothing"
+fmtMoneyM (Just n) = printf "%.8F" $ (fromRational n :: Double)
+
+fmtMoney = printf "%.8F" 
 
 epochToUTC = posixSecondsToUTCTime . fromIntegral
+
 watchOrderBook marketList chan = do
   putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
   cf <- readCloudFlare
@@ -173,13 +198,12 @@ ws marketList chan connection = do
           Right btrMsg -> do
             now <- round `fmap` getPOSIXTime
             case btrMsg of
-              BtrMsgState i state -> do
-                putStrLn $ show $ map btrFillOrderTimestamp $ btrStateFills state
+              BtrMsgParsedState i state -> do
                 invMap <- readIORef invIORef
                 let marketName = invMap M.! i
-                modifyIORef nouncesIORef (M.alter (\_ -> Just $ btrStateNounce state) marketName)
-                writeChan chan $ TimedMsg now btrMsg
-              BtrMsgDelta delta -> do
+                modifyIORef nouncesIORef (M.alter (\_ -> Just $ btrStateNounceNM state) marketName)
+                writeChan chan $ TimedMsg now $ BtrMsgState $ mkBtrState marketName state
+              BtrMsgParsedDelta delta -> do
                 nounces <- readIORef nouncesIORef
                 let currentNounce = btrDeltaNounce delta
                     marketName = marketNameD delta
@@ -190,7 +214,7 @@ ws marketList chan connection = do
                 else do
                   -- just update last nounce
                   modifyIORef nouncesIORef (M.update (\_ -> Just currentNounce) marketName)
-                  writeChan chan $ TimedMsg now btrMsg
+                  writeChan chan $ TimedMsg now $ BtrMsgDelta delta
 
 --  TODO: vymysliet ako zavriet socket ked skonci thready
 --  sendClose connection (pack "Bye!")
@@ -220,14 +244,14 @@ parseDelta csm
   where method = methodName csm
 
 
-parseState :: SMessageResult -> Either String BtrState
+parseState :: SMessageResult -> Either String BtrStateNoMarket
 parseState smr = parseEither parseJSON (fromJust $ r smr)
 
 decodeToSMsg :: BL.ByteString -> Either String SMsg  
 decodeToSMsg rawMessage = A.eitherDecode rawMessage 
 
 -- | Function to decode SMsg. Be carefull may lose some messages because it takes only first element of response array. Because so far I havent seen bigger arrays.
-decodeSMsg :: SMsg -> Either String BtrMsg
+decodeSMsg :: SMsg -> Either String BtrMsgParsed
 decodeSMsg smsg = case smsg of
   SMsg smessage ->
     let maybeClientSideMsg = (parseClientSideMsg smessage) >>= listToMaybe
@@ -235,8 +259,8 @@ decodeSMsg smsg = case smsg of
            Nothing -> Left $ "Failed to decode smessage:" ++ (show smessage)
            Just csm -> {-D.trace ("Delta original: " ++ (BL.unpack $ show3 csm)) $-} case parseDelta csm of
                          Left err -> Left $ "Failed decoding delta from clientSideMsg: " ++ err
-                         Right (x:xs) -> Right $ BtrMsgDelta x
+                         Right (x:xs) -> Right $ BtrMsgParsedDelta x
   SMsgR smr ->
     let state = {--D.trace ("SMessageResult: " ++ (show smr)) $--} parseState smr
-        in fmap (BtrMsgState $ fromMaybe "-2" (i smr)) state
+        in fmap (BtrMsgParsedState $ fromMaybe "-2" (i smr)) state
 
