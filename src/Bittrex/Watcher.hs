@@ -3,7 +3,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Bittrex.Watcher where
-import           Bittrex.Proto
+import           Bittrex.Proto hiding (fromBittrexPair, toBittrexPair)
 import           Model.MarketModel
 import           Control.Concurrent (forkIO)
 import           Control.Monad (mfilter, forever, unless, void, join)

@@ -1,3 +1,5 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Bittrex.Proto where
@@ -99,7 +101,7 @@ data UTCTimeNoZ = UTCTimeNoZ {
 
 
 instance ToJSON UTCTimeNoZ where
-    toJSON t = String (pack (take 23 str ++ "Z"))
+    toJSON t = String (pack (take 23 str))
       where str = formatTime defaultTimeLocale "%FT%T%Q" (fromUTCTimeNoZ t)
     {-# INLINE toJSON #-}
 
@@ -140,7 +142,7 @@ instance FromJSON BtrFillD where
 
 data BtrDelta = BtrDelta {
    btrDeltaNounce :: Int
- , btrDeltaMarketName :: Text
+ , btrDeltaMarketName :: ExPair
  , btrDeltaSells :: [BtrOrderD]
  , btrDeltaFills :: [BtrFillD]
  , btrDeltaBuys :: [BtrOrderD]
@@ -150,8 +152,8 @@ data BtrDelta = BtrDelta {
 instance FromJSON BtrDelta where
   parseJSON = withObject "BtrDelta" $ \v -> BtrDelta
     <$> v .: "Nounce"
-    <*> v .: "MarketName"
-    <*> v .: "Sells"
+    <*> (toExPair <$> (v .: "MarketName"))
+    <*> v .: "Sells" 
     <*> v .: "Fills"
     <*> v .: "Buys"
   
@@ -159,6 +161,20 @@ instance FromJSON BtrOrder where
   parseJSON = withObject "BtrOrder" $ \v -> BtrOrder
     <$> asRational (v .: "Quantity")
     <*> asRational (v .: "Rate")
+
+newtype ExPairBtr = ExPairBtr {
+  toExPair :: ExPair  
+}
+
+fromBittrexPair s = let (bs, fxs) = break (=='-') s
+                  in (tail fxs, bs)
+toBittrexPair (fx,base) = base ++ "-" ++ fx
+  
+instance FromJSON ExPairBtr where
+  parseJSON = withText "MarketName" $ \t -> pure $ ExPairBtr $ fromBittrexPair (unpack t) 
+
+instance ToJSON ExPairBtr where
+  toJSON = String . pack . toBittrexPair . toExPair
 
 data BtrFill = BtrFill {
    btrFillType :: Text
@@ -239,8 +255,14 @@ instance Binary UTCTime where
 
 standardFormat = "%FT%T%Q"
 
-data TimedMsg = TimedMsg Integer BtrMsg deriving (Generic, Show)
+data TimedMsg = TimedMsg UTCTime BtrMsg deriving (Generic, Show)
 instance Binary TimedMsg
+
+data Timed a = Timed UTCTime a 
+
+instance Functor (Timed) where
+  fmap f (Timed t x) = Timed t (f x)
+
 
 {-- Convert to MarketModel functions --}
 updateOrder :: BtrOrderD -> MarketOrders -> MarketOrders
@@ -278,3 +300,10 @@ decodeR c
   in case parsed of
        Left (rest, offset, err) -> error $ ("Error when decoding input: " ++ err)
        Right (rest, offset, msg) -> msg : decodeR rest
+
+
+{- Utility function to display messages -}
+displayBtr (TimedMsg t (BtrMsgDelta delta)) = putStrLn $ unwords [showTs t, " delta of market: ", show $ btrDeltaMarketName delta]
+displayBtr (TimedMsg t (BtrMsgState state)) = putStrLn $ unwords [showTs t, " state of market: ", show $ btrStateMarketName state]
+
+showTs t = "[" ++ (show t) ++ "]"

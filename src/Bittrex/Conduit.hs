@@ -1,9 +1,12 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Bittrex.Conduit where
 import           Bittrex.Proto
+import qualified Bittrex.ProtoUtil as PU
+import           Bittrex.Reader
 import           Model.MarketModel
 import           Control.Concurrent (forkIO)
 import           Control.Monad (mfilter, forever, unless, void, join)
@@ -12,6 +15,7 @@ import           Data.Text (Text, pack)
 import           GHC.Generics
 import           Network.WebSockets (ClientApp, receiveData, sendClose, sendTextData, defaultConnectionOptions)
 import           Wuss
+import           Network.WebSockets (ConnectionException(..))
 
 import           Network.URL
 import           Data.Aeson.Encode.Pretty
@@ -26,6 +30,7 @@ import           Text.Printf
 import Control.Monad
 import Control.Concurrent.MVar
 --import           Control.Concurrent
+import           Control.Exception (catch)
 import qualified Debug.Trace as D
 import           System.IO
 import           Data.Binary (encode)
@@ -39,8 +44,12 @@ import qualified Data.Conduit.List as CL
 import qualified Data.Conduit.Combinators as CC
 
 import           Data.IORef
-import           Data.Time.Clock (UTCTime)
+import           Data.Time.Clock (UTCTime, diffUTCTime)
 import qualified Data.Time.Format as TF
+
+import qualified System.IO as IO
+import qualified Bittrex.TimeUtil as UTC
+import           Data.Time.Format (formatTime, defaultTimeLocale)
 {-
 TODO:
 1. import receiving data for multiple markets at the same time
@@ -51,15 +60,84 @@ TODO:
 
 mainSimple = do
   let marketList = [("ETH", "BTC")] --,("BCC", "BTC"),("ETH", "BTC")]
-
+{--
   c <- newChan
   forkIO $ forever $ watchOrderBook marketList c
-
+--}
+{-- 
   runConduit $ sourceChan c
     .| CC.map extractPrice
     .| CC.filter isJust
     .| CL.mapM_ (displayTicker . fromJust)
+--}
+  runConduit $ dataSource
+--    .| CC.mapM_ (\(TimedMsg t m)-> putStrLn $ show $ PU.marketName m)
+    .| CC.filter (\(TimedMsg t m)-> PU.marketName m == ("XMR","BTC"))
+    .| CC.scanlM collectFills []
+    .| CC.map avg60Fills
+    .| sinkNull
+ --   .| CC.mapM_ (putStrLn . fmtMoney . fromRational)
+{--
+  total <- runConduit $ dataSource
+    .| CC.filter (\(TimedMsg _ m) -> isState m)
+    .| CC.mapM_ (putStrLn . stateStats)
+--    .| CC.map avg60Fills
+--    .| CC.filter (>1)
+    .| CC.sum
+--    .| CL.mapM_ (putStrLn . fmtMoney . fromRational)
+  putStrLn $ "Total number of state msgs:" ++ (show total)
+-- CL.mapAccumM
+--}
+stateStats (TimedMsg t (BtrMsgState s)) =
+  let fil = map btrFillOrderTimestamp $ btrStateFills s
+      minD = minimum fil
+      maxD = maximum fil
+      d = diffUTCTime maxD minD
+  in concat ["[", show t, "] ", "Fills count=", show $ length fil, ", "," span = ", formatDiff $ floor d]
+
+
+stateStats _ = "Not a state message"
+
+formatDiff total_s =
+  let (d,r1) = total_s `divMod` (3600*24)
+      (h,r2) = r1 `divMod` 3600
+      (m,s) = r2 `divMod` 60
+  in concat [show d, " days ", show h, ":", show m, ":", show s]
+isState (BtrMsgState _) = True
+isState _ = False
+
+collectFillsT :: Timed [BtrFillD] -> TimedMsg -> IO (Timed [BtrFillD])
+collectFillsT (Timed _ acc) m@(TimedMsg t _) = Timed t <$> (collectFills acc m)
+
+collectFills :: [BtrFillD] -> TimedMsg -> IO [BtrFillD]
+collectFills fills (TimedMsg t (BtrMsgDelta delta)) = do
+--  putStrLn $ "Delta fills: " ++ (show $ btrDeltaFills delta)
+  let s = (btrDeltaFills delta) ++ fills
+--  putStrLn $ "[" ++ show t ++ "] Got delta update "
+  return s
+collectFills fills (TimedMsg t (BtrMsgState state)) = do
+  let theirFills = btrStateFills state
   
+  if not (null fills || null theirFills) then do
+    let latest = maximum $ map btrFillDOrderTimestamp fills
+    let first = minimum $ map btrFillOrderTimestamp theirFills
+  
+    let fresh = filter (\x -> btrFillOrderTimestamp x > latest) $ theirFills
+    let freshD = map fromFill fresh
+    when (not $ null freshD) $ do
+      putStrLn $ "[" ++ show t ++ "] " ++ (show $ btrStateMarketName state) ++" state update my latest: " ++ show latest ++ ", theirs first: " ++ show first ++ " Fresh to add: " ++ (show $ length freshD)
+    return $ fills ++ freshD
+  else
+    return $ fills ++ (map fromFill theirFills)
+
+  where fromFill x = BtrFillD (btrFillQuantity x) (btrFillOrderType x) (btrFillPrice x) (btrFillOrderTimestamp x) 
+
+avg60Fills xs =
+  let last60 = take 60 xs
+      sum60 = sum $ map btrFillDOrderRate last60
+      len = length last60
+  in if len > 0 then (sum60 / (fromIntegral len)) else 0
+
 mainSimpleBtr = do
   let marketList = [("ETH", "BTC"),("BCC", "BTC"),("XMR", "BTC")]
 
@@ -69,10 +147,41 @@ mainSimpleBtr = do
   runConduit $ sourceChan c
     .| CL.mapM_ (displayBtr)
 
-displayBtr (TimedMsg t (BtrMsgDelta delta)) = putStrLn $ unwords [showTs t, " delta of market: ", show $ btrDeltaMarketName delta]
-displayBtr (TimedMsg t (BtrMsgState state)) = putStrLn $ unwords [showTs t, " state of market: ", show $ btrStateMarketName state]
+mainWriter = do 
+  let marketList = [("ETH", "BTC"),("BCC", "BTC"),("XMR", "BTC")]
 
-showTs t = "[" ++ (show t) ++ "]"
+  c <- newChan
+  forkIO $ forever $ watchOrderBook marketList c
+
+  writeLoop c Nothing
+  where writeLoop c s = do
+          event@(TimedMsg t m) <- readChan c
+          (file, nextState) <- getNextState s t
+          BL.hPut file (encode event)
+          displayBtr event
+          writeLoop c $ Just nextState
+        getNextState s t = do
+          let eventBlockStart = blockStartTime t
+          case s of
+            Nothing -> do h <- openNewBinary eventBlockStart
+                          return (h, WriteState eventBlockStart h)
+            Just s -> do h <- if (startTime s == eventBlockStart) then
+                                 return $ file s
+                              else do
+                                 IO.hClose $ file s
+                                 openNewBinary eventBlockStart
+                         return $ (h, WriteState eventBlockStart h)
+
+        openNewBinary t = IO.openBinaryFile (mkFilename t) IO.AppendMode
+        blockStartTime t = UTC.zeroAfterHours t
+
+        mkFilename t = concat ["data/bittrex_", formatTime defaultTimeLocale "%F_%T" t, ".dat"]
+
+data WriteState = WriteState {
+  startTime :: UTCTime
+ , file :: IO.Handle
+}
+
 --  forever $ do
 --    tm@(TimedMsg t msg) <- readChan c
 --    let xmr_btc = M.
@@ -114,17 +223,23 @@ fmtMoney = printf "%.8F"
 epochToUTC = posixSecondsToUTCTime . fromIntegral
 
 watchOrderBook marketList chan = do
-  putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
-  cf <- readCloudFlare
-  putStrLn $ "Using cf:" ++ (show cf)
-  let options = defaultConnectionOptions
-  let headers = [("Cookie", BS.pack (cookies cf))
-                ,("User-Agent", BS.pack (userAgent cf))] 
-  runSecureClientWith "socket.bittrex.com" 443 (exportURL relativeUrl) options headers $ ws marketList chan
-  
+  goCatched
   putStrLn "Finished"
   putStrLn $ exportURL relativeUrl 
 
+  where go = do
+          putStrLn $ "Relative url: " ++ (exportURL relativeUrl)
+          cf <- readCloudFlare
+          putStrLn $ "Using cf:" ++ (show cf)
+          let options = defaultConnectionOptions
+          let headers = [("Cookie", BS.pack (cookies cf))
+                        ,("User-Agent", BS.pack (userAgent cf))] 
+          runSecureClientWith "socket.bittrex.com" 443 (exportURL relativeUrl) options headers $ ws marketList chan
+        goCatched = do
+          go `catch` (\(e :: ConnectionException) -> do
+                        putStrLn $ "ConnectionException closed connection: " ++(show e)++" . Reconnecting..."
+                        goCatched)
+            
 relativeUrl = URL HostRelative "signalr/connect" socketParams
 
 socketParams =
@@ -151,8 +266,8 @@ data CloudFlare = CloudFlare {
 instance FromJSON CloudFlare
 
 
-subscribeToExchangeDeltas pair = ServerSideMsg "corehub" "SubscribeToExchangeDeltas" (toJSON [toBittrexPair pair]) "-1"
-queryExchangeState pair = ServerSideMsg "corehub" "QueryExchangeState" (toJSON [pair])
+subscribeToExchangeDeltas pair = ServerSideMsg "corehub" "SubscribeToExchangeDeltas" (toJSON [ExPairBtr pair]) "-1"
+queryExchangeState pair = ServerSideMsg "corehub" "QueryExchangeState" (toJSON [ExPairBtr pair])
 
  
 --show2 smsg = encodePretty $ m smsg
@@ -162,7 +277,7 @@ show3 csm = encodePretty $ args csm
 
 
 queryExState connection marketName i = do
-    let queryCommand = A.encode $ queryExchangeState (toBittrexPair marketName) i
+    let queryCommand = A.encode $ queryExchangeState marketName i
     sendTextData connection queryCommand
 
 
@@ -196,7 +311,7 @@ ws marketList chan connection = do
         case eitherBtrMsg of
           Left err -> putStrLn $ "Failed to decode message from server" ++ err
           Right btrMsg -> do
-            now <- round `fmap` getPOSIXTime
+            now <- getCurrentTime
             case btrMsg of
               BtrMsgParsedState i state -> do
                 invMap <- readIORef invIORef
@@ -221,7 +336,7 @@ ws marketList chan connection = do
     putStrLn "Main thread goind to sleep"
 
 marketNameD :: BtrDelta -> ExPair
-marketNameD delta = fromBittrexPair $ T.unpack $ btrDeltaMarketName delta
+marketNameD delta = btrDeltaMarketName delta
 
        
 maybeTuple (Just a, Just b) = Just (a,b)
