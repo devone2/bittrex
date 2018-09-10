@@ -91,7 +91,7 @@ image:
 
       # You can optionally name the image. Stack will use the project
       # directory name if you leave out this option.
-      name: "fpco/hello-world"
+      name: "fpco/bittrex-writer"
 
       # Optionally add a directory to a path inside the docker image.
 #      add:
@@ -101,4 +101,4 @@ image:
       # a tagged image for each in the list. these images will have
       # their respective "ENTRYPOINT" set.
       entrypoints:
-        - stack
+        - writer
